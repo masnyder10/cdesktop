@@ -60,6 +60,23 @@ export interface WorkspaceSummaryProps {
   onDragEnd?: (e: React.DragEvent<HTMLDivElement>) => void;
 }
 
+/**
+ * Numeric date for the sidebar, e.g. `8/29/26`. Deliberately absolute rather
+ * than relative ("2h ago"): the point is chronology across a long list, where
+ * relative ages stop being comparable once entries are days apart.
+ */
+function formatShortDate(dateString: string): string {
+  const date = new Date(dateString);
+  if (Number.isNaN(date.getTime())) {
+    return '';
+  }
+  return date.toLocaleDateString(undefined, {
+    month: 'numeric',
+    day: 'numeric',
+    year: '2-digit',
+  });
+}
+
 export function WorkspaceSummary({
   name,
   workspaceId,
@@ -259,6 +276,23 @@ export function WorkspaceSummary({
           </div>
         )}
       </button>
+
+      {/* Date of last activity, for chronology at a glance.
+          Summary rows omit the detail line that carries the elapsed time, so
+          without this the sidebar shows no time information at all. Mirrors the
+          hover action's gradient-and-background treatment so a long title fades
+          out underneath rather than colliding, and yields to that action on
+          hover since they occupy the same corner. */}
+      {summary && latestProcessCompletedAt && (
+        <div className="absolute right-0 top-0 bottom-0 flex items-center pointer-events-none transition-opacity sm:group-hover:opacity-0">
+          <div className="h-full w-4 bg-gradient-to-r from-transparent to-secondary" />
+          <div className="flex items-center h-full pr-base bg-secondary">
+            <span className="text-xs text-low tabular-nums">
+              {formatShortDate(latestProcessCompletedAt)}
+            </span>
+          </div>
+        </div>
+      )}
 
       {/* Right-side hover action - more options only */}
       {workspaceId && onOpenWorkspaceActions && (
