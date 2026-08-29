@@ -1,15 +1,19 @@
 {
   "$schema": "https://raw.githubusercontent.com/tauri-apps/tauri/dev/crates/tauri-cli/schema.json",
-  "productName": "cdesktop",
+  "productName": "cdesktop-mr",
   "version": "0.2.3",
-  "identifier": "ai.cdesktop",
+  "identifier": "com.littleway.cdesktop",
   "build": {
     "beforeDevCommand": {
       "script": "concurrently \"pnpm run backend:dev:watch\" \"pnpm run local-web:dev\"",
       "cwd": "../.."
     },
     "devUrl": "http://localhost:3000",
-    "frontendDist": "./splash"
+    "frontendDist": "./splash",
+    "beforeBuildCommand": {
+      "script": "pnpm --filter @vibe/local-web run build",
+      "cwd": "../.."
+    }
   },
   "app": {
     "windows": [],
@@ -34,14 +38,14 @@
     "category": "DeveloperTool",
     "shortDescription": "Local desktop client for Claude Code",
     "longDescription": "cdesktop: a local desktop/web client for the Claude Code CLI",
-    "createUpdaterArtifacts": true
+    "createUpdaterArtifacts": false
   },
   "plugins": {
     "macos-fps": {},
     "updater": {
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDMyN0ZCNDVCMDhFMDdEQjAKUldTd2ZlQUlXN1IvTWt1Z0ZmaWpsUUVGOHl3QUExRVVWL0crWkROSjViRUZSTXdUODN4WkFlQ1AK",
       "endpoints": [
-        "__TAURI_UPDATE_ENDPOINT__"
+        "https://localhost/disabled"
       ]
     }
   }
