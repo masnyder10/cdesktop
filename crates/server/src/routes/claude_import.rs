@@ -16,7 +16,7 @@
 //! moved, or reformatted.
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
 };
 
@@ -87,11 +87,17 @@ pub struct ImportRequest {
     /// Restrict the import to these Claude session ids. `None` imports everything found.
     #[serde(default)]
     pub session_ids: Option<Vec<String>>,
+    /// Also re-sync sessions that were already imported. An import is a point-in-time
+    /// snapshot, so a session that was still being written when it was imported stays
+    /// frozen at that point without this.
+    #[serde(default)]
+    pub refresh: bool,
 }
 
 #[derive(Debug, Serialize, TS)]
 pub struct ImportResponse {
     pub imported: usize,
+    pub refreshed: usize,
     pub skipped: usize,
     pub failed: Vec<String>,
 }
@@ -365,26 +371,76 @@ fn scan_disk() -> Vec<DiscoveredSession> {
     out
 }
 
-/// Claude session ids already present in the database.
-async fn already_imported_ids(deployment: &DeploymentImpl) -> Result<HashSet<String>, sqlx::Error> {
+/// Maps each already-imported Claude session id to the cdesktop rows holding it:
+/// `(execution_process_id, session_id)`. Those two are what locate the transcript
+/// file on disk, so a refresh can rewrite it in place.
+async fn imported_map(
+    deployment: &DeploymentImpl,
+) -> Result<HashMap<String, (Uuid, Uuid)>, sqlx::Error> {
     // Deliberately not a `query!` macro: this is a new query, and the macro form would
     // require regenerating the offline sqlx metadata.
-    let rows: Vec<(Option<String>,)> =
-        sqlx::query_as("SELECT agent_session_id FROM coding_agent_turns")
-            .fetch_all(&deployment.db().pool)
-            .await?;
-    Ok(rows.into_iter().filter_map(|(id,)| id).collect())
+    let rows: Vec<(String, Uuid, Uuid)> = sqlx::query_as(
+        r#"SELECT t.agent_session_id, t.execution_process_id, p.session_id
+           FROM coding_agent_turns t
+           JOIN execution_processes p ON p.id = t.execution_process_id
+           WHERE t.agent_session_id IS NOT NULL"#,
+    )
+    .fetch_all(&deployment.db().pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|(claude_id, process_id, session_id)| (claude_id, (process_id, session_id)))
+        .collect())
+}
+
+/// Write a session's entries out as the JSONL-of-`LogMsg` file the transcript viewer
+/// reads. Any existing file is replaced, so this doubles as the refresh path.
+async fn write_transcript(
+    session_id: Uuid,
+    process_id: Uuid,
+    entries: &[NormalizedEntry],
+) -> std::io::Result<()> {
+    let path = utils::execution_logs::process_log_file_path(session_id, process_id);
+    // ExecutionLogWriter appends, so a stale file has to go first or a refresh would
+    // duplicate every entry.
+    if path.exists() {
+        std::fs::remove_file(&path)?;
+    }
+
+    let mut writer = ExecutionLogWriter::new(path).await?;
+    for (index, entry) in entries.iter().enumerate() {
+        let patch = ConversationPatch::add_normalized_entry(index, entry.clone());
+        let line = serde_json::to_string(&LogMsg::JsonPatch(patch)).map_err(std::io::Error::other)?;
+        writer.append_jsonl_line(&format!("{line}\n")).await?;
+    }
+    let finished = serde_json::to_string(&LogMsg::Finished).map_err(std::io::Error::other)?;
+    writer.append_jsonl_line(&format!("{finished}\n")).await?;
+    Ok(())
+}
+
+/// Re-sync an already-imported session whose transcript has grown since import.
+async fn refresh_one(
+    deployment: &DeploymentImpl,
+    discovered: &DiscoveredSession,
+    process_id: Uuid,
+    session_id: Uuid,
+) -> Result<(), ApiError> {
+    write_transcript(session_id, process_id, &discovered.entries).await?;
+    // The title can change too: Claude rewrites `ai-title` as a conversation develops.
+    CodingAgentTurn::update_summary(&deployment.db().pool, process_id, &discovered.title).await?;
+    Ok(())
 }
 
 async fn scan(
     State(deployment): State<DeploymentImpl>,
 ) -> Result<ResponseJson<ApiResponse<ScanResponse>>, ApiError> {
-    let existing = already_imported_ids(&deployment).await?;
+    let existing = imported_map(&deployment).await?;
     let all = scan_disk();
     let total = all.len();
     let sessions: Vec<_> = all
         .into_iter()
-        .filter(|s| !existing.contains(&s.claude_session_id))
+        .filter(|s| !existing.contains_key(&s.claude_session_id))
         .collect();
     let already_imported = total - sessions.len();
 
@@ -476,17 +532,7 @@ async fn import_one(
     .await?;
 
     // 5. Transcript, written in the same JSONL-of-LogMsg form the live path uses.
-    let mut writer = ExecutionLogWriter::new_for_execution(session.id, process.id).await?;
-
-    for (index, entry) in discovered.entries.iter().enumerate() {
-        let patch = ConversationPatch::add_normalized_entry(index, entry.clone());
-        let line = serde_json::to_string(&LogMsg::JsonPatch(patch))
-            .map_err(std::io::Error::other)?;
-        writer.append_jsonl_line(&format!("{line}\n")).await?;
-    }
-
-    let finished = serde_json::to_string(&LogMsg::Finished).map_err(std::io::Error::other)?;
-    writer.append_jsonl_line(&format!("{finished}\n")).await?;
+    write_transcript(session.id, process.id, &discovered.entries).await?;
 
     ExecutionProcess::update_completion(
         pool,
@@ -520,19 +566,16 @@ async fn run_import(
     State(deployment): State<DeploymentImpl>,
     axum::Json(payload): axum::Json<ImportRequest>,
 ) -> Result<ResponseJson<ApiResponse<ImportResponse>>, ApiError> {
-    let existing = already_imported_ids(&deployment).await?;
+    let existing = imported_map(&deployment).await?;
     let wanted: Option<HashSet<String>> =
         payload.session_ids.map(|ids| ids.into_iter().collect());
 
     let mut imported = 0usize;
+    let mut refreshed = 0usize;
     let mut skipped = 0usize;
     let mut failed = Vec::new();
 
     for discovered in scan_disk() {
-        if existing.contains(&discovered.claude_session_id) {
-            skipped += 1;
-            continue;
-        }
         if let Some(wanted) = &wanted
             && !wanted.contains(&discovered.claude_session_id)
         {
@@ -540,20 +583,33 @@ async fn run_import(
             continue;
         }
 
-        match import_one(&deployment, &discovered).await {
-            Ok(()) => imported += 1,
-            Err(e) => {
-                tracing::warn!(
-                    "Failed to import Claude session {}: {e}",
-                    discovered.claude_session_id
-                );
-                failed.push(discovered.claude_session_id.clone());
+        let result = match existing.get(&discovered.claude_session_id) {
+            Some(&(process_id, session_id)) => {
+                if !payload.refresh {
+                    skipped += 1;
+                    continue;
+                }
+                refresh_one(&deployment, &discovered, process_id, session_id)
+                    .await
+                    .map(|()| refreshed += 1)
             }
+            None => import_one(&deployment, &discovered)
+                .await
+                .map(|()| imported += 1),
+        };
+
+        if let Err(e) = result {
+            tracing::warn!(
+                "Failed to import Claude session {}: {e}",
+                discovered.claude_session_id
+            );
+            failed.push(discovered.claude_session_id.clone());
         }
     }
 
     Ok(ResponseJson(ApiResponse::success(ImportResponse {
         imported,
+        refreshed,
         skipped,
         failed,
     })))

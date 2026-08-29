@@ -86,6 +86,17 @@ NSIS `.exe` installers natively on Windows 11.
     moved, or reformatted.
   - Endpoints: `GET /api/claude-import/scan` (dry run) and
     `POST /api/claude-import/run`.
+  - `POST /api/claude-import/run` accepts `{"refresh": true}` to re-sync sessions
+    that were already imported. An import is a point-in-time snapshot, so a
+    session still being written when it was imported would otherwise stay frozen
+    at that point forever, since the idempotency check skips it. Refresh rewrites
+    the transcript file in place, keeping the workspace, session and process ids
+    stable, and updates the title (Claude rewrites `ai-title` as a conversation
+    develops).
+  - Fidelity: `tool_result` blocks are skipped because `NormalizedEntry` has no
+    ToolResult variant, which is also why the live normaliser drops them.
+    `thinking` blocks are skipped when empty; in current transcripts the
+    reasoning text is not stored, only an opaque `signature`.
 
 - **`crates/server/src/routes/mod.rs`**
   - Declare and merge the `claude_import` router.
