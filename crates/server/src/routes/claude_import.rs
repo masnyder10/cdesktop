@@ -799,6 +799,12 @@ async fn import_one(
     // Last, because update_completion above stamps completed_at with the current time.
     apply_real_timestamps(deployment, workspace.id, process.id, discovered).await?;
 
+    // Turns are created unread, which is right for a live reply the user has not
+    // looked at yet. Imported history is the opposite: these conversations already
+    // happened, so leaving them unread marks the whole backlog as new activity and
+    // makes the unseen indicator useless for spotting anything actually new.
+    CodingAgentTurn::mark_seen_by_workspace_id(pool, workspace.id).await?;
+
     Ok(())
 }
 
