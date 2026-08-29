@@ -93,6 +93,16 @@ NSIS `.exe` installers natively on Windows 11.
     the transcript file in place, keeping the workspace, session and process ids
     stable, and updates the title (Claude rewrites `ai-title` as a conversation
     develops).
+  - Runs automatically shortly after server startup, spawned rather than awaited
+    so a large store never delays boot. Only sessions whose transcript is newer
+    than the last written copy are rewritten, so a normal launch touches almost
+    nothing (2 of 51 files in practice).
+  - Emits a `TokenUsageInfo` entry per imported session, which feeds the existing
+    `ContextUsageGauge`. Context occupancy is the input side plus both cache
+    buckets, excluding output tokens, matching the live gauge. The context window
+    is inferred from usage above 200K when the transcript records a plain model
+    id without the `[1m]` marker; taking the id at face value would otherwise
+    peg a 1M session at 100%.
   - Fidelity: `tool_result` blocks are skipped because `NormalizedEntry` has no
     ToolResult variant, which is also why the live normaliser drops them.
     `thinking` blocks are skipped when empty; in current transcripts the

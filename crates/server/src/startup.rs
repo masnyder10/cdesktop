@@ -182,6 +182,10 @@ pub async fn initialize_deployment(
     // Spawn the in-process routine scheduler (60s tick + boot missed-run handler).
     crate::routines_scheduler::spawn(deployment.clone());
 
+    // Bring imported Claude Code history up to date. Only transcripts that changed
+    // since the last sync are rewritten, so this is cheap on a normal launch.
+    crate::routes::claude_import::spawn_startup_refresh(deployment.clone());
+
     Ok(deployment)
 }
 

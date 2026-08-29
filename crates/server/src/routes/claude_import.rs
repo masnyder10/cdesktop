@@ -41,7 +41,7 @@ use deployment::Deployment;
 use executors::{
     actions::{ExecutorAction, ExecutorActionType, coding_agent_initial::CodingAgentInitialRequest},
     logs::{
-        ActionType, NormalizedEntry, NormalizedEntryType, ToolStatus,
+        ActionType, NormalizedEntry, NormalizedEntryType, TokenUsageInfo, ToolStatus,
         utils::patch::ConversationPatch,
     },
     profile::ExecutorConfig,
@@ -74,6 +74,11 @@ pub struct DiscoveredSession {
     #[ts(skip)]
     #[serde(skip)]
     pub first_prompt: Option<String>,
+    /// Transcript this came from. Used to skip refreshing sessions whose source
+    /// has not changed since the last import.
+    #[ts(skip)]
+    #[serde(skip)]
+    pub source_path: PathBuf,
 }
 
 #[derive(Debug, Serialize, TS)]
@@ -135,6 +140,35 @@ fn text_of(content: &serde_json::Value) -> Option<String> {
         }
     }
     if out.trim().is_empty() { None } else { Some(out) }
+}
+
+/// Context occupancy from an assistant record's `usage` block: everything that
+/// counts against the window, which is the input side plus both cache buckets.
+/// Output tokens are excluded, matching what the live gauge reports.
+fn context_tokens_from_usage(usage: &serde_json::Value) -> Option<u32> {
+    let field = |name: &str| usage.get(name).and_then(|v| v.as_u64()).unwrap_or(0);
+    let total = field("input_tokens")
+        + field("cache_creation_input_tokens")
+        + field("cache_read_input_tokens");
+    if total == 0 {
+        None
+    } else {
+        Some(total.min(u32::MAX as u64) as u32)
+    }
+}
+
+/// Live runs learn the window from a system init message carrying a `[1m]` model
+/// id. Transcripts often record the plain id (`claude-opus-5`) even for a 1M
+/// session, so fall back to inferring it from usage that exceeds the standard
+/// window rather than reporting a session as over 100% full.
+fn context_window_for(model: Option<&str>, total_tokens: u32) -> u32 {
+    const STANDARD: u32 = 200_000;
+    const EXTENDED: u32 = 1_000_000;
+    if model.is_some_and(|m| m.contains("[1m]")) || total_tokens > STANDARD {
+        EXTENDED
+    } else {
+        STANDARD
+    }
 }
 
 fn message_entry_type(role: &str) -> NormalizedEntryType {
@@ -217,6 +251,10 @@ fn parse_transcript(path: &Path) -> Option<DiscoveredSession> {
     let mut first_prompt: Option<String> = None;
     let mut entries: Vec<NormalizedEntry> = Vec::new();
     let mut claude_session_id: Option<String> = None;
+    // Last assistant record that reported usage wins: that is where the
+    // conversation's context stood when it ended.
+    let mut last_context_tokens: Option<u32> = None;
+    let mut last_model: Option<String> = None;
 
     for line in raw.lines() {
         if line.trim().is_empty() {
@@ -273,6 +311,17 @@ fn parse_transcript(path: &Path) -> Option<DiscoveredSession> {
                     .get("role")
                     .and_then(|r| r.as_str())
                     .unwrap_or(rec_type);
+                if role == "assistant"
+                    && let Some(usage) = message.get("usage")
+                    && let Some(tokens) = context_tokens_from_usage(usage)
+                {
+                    last_context_tokens = Some(tokens);
+                    last_model = message
+                        .get("model")
+                        .and_then(|m| m.as_str())
+                        .map(String::from);
+                }
+
                 let Some(content) = message.get("content") else {
                     continue;
                 };
@@ -317,6 +366,26 @@ fn parse_transcript(path: &Path) -> Option<DiscoveredSession> {
         return None;
     }
 
+    // Counted before the synthetic usage entry is appended, so the reported
+    // message count stays a count of real conversation content.
+    let message_count = entries.len();
+
+    // Feeds the existing ContextUsageGauge. The frontend takes the latest such
+    // entry and filters it out of the visible timeline, so appending one here
+    // lights up the gauge without adding a row to the transcript.
+    if let Some(total_tokens) = last_context_tokens {
+        let model_context_window = context_window_for(last_model.as_deref(), total_tokens);
+        entries.push(NormalizedEntry {
+            timestamp: None,
+            entry_type: NormalizedEntryType::TokenUsageInfo(TokenUsageInfo {
+                total_tokens,
+                model_context_window,
+            }),
+            content: format!("Tokens used: {total_tokens} / Context window: {model_context_window}"),
+            metadata: None,
+        });
+    }
+
     let title = title
         .or_else(|| {
             first_prompt.as_ref().map(|p| {
@@ -331,11 +400,12 @@ fn parse_transcript(path: &Path) -> Option<DiscoveredSession> {
         claude_session_id,
         cwd: normalize_cwd(&cwd),
         title,
-        message_count: entries.len(),
+        message_count,
         started_at,
         git_branch,
         entries,
         first_prompt,
+        source_path: path.to_path_buf(),
     })
 }
 
@@ -419,6 +489,24 @@ async fn write_transcript(
     Ok(())
 }
 
+/// Whether the source transcript is newer than what was last written for it.
+/// Rewriting 50-odd transcripts on every launch is pointless churn when almost
+/// none of them have changed.
+fn source_is_newer(discovered: &DiscoveredSession, session_id: Uuid, process_id: Uuid) -> bool {
+    let imported = utils::execution_logs::process_log_file_path(session_id, process_id);
+    let (Ok(src), Ok(dst)) = (
+        std::fs::metadata(&discovered.source_path),
+        std::fs::metadata(&imported),
+    ) else {
+        // Missing either side: fall back to refreshing rather than silently skipping.
+        return true;
+    };
+    match (src.modified(), dst.modified()) {
+        (Ok(src_time), Ok(dst_time)) => src_time > dst_time,
+        _ => true,
+    }
+}
+
 /// Re-sync an already-imported session whose transcript has grown since import.
 async fn refresh_one(
     deployment: &DeploymentImpl,
@@ -430,6 +518,89 @@ async fn refresh_one(
     // The title can change too: Claude rewrites `ai-title` as a conversation develops.
     CodingAgentTurn::update_summary(&deployment.db().pool, process_id, &discovered.title).await?;
     Ok(())
+}
+
+/// Shared driver for the import endpoint and the startup refresh.
+///
+/// `only_stale` skips already-imported sessions whose transcript has not changed,
+/// which is what makes running this on every launch cheap.
+pub async fn import_and_refresh(
+    deployment: &DeploymentImpl,
+    wanted: Option<HashSet<String>>,
+    refresh: bool,
+    only_stale: bool,
+) -> Result<ImportResponse, ApiError> {
+    let existing = imported_map(deployment).await?;
+
+    let mut imported = 0usize;
+    let mut refreshed = 0usize;
+    let mut skipped = 0usize;
+    let mut failed = Vec::new();
+
+    for discovered in scan_disk() {
+        if let Some(wanted) = &wanted
+            && !wanted.contains(&discovered.claude_session_id)
+        {
+            skipped += 1;
+            continue;
+        }
+
+        let result = match existing.get(&discovered.claude_session_id) {
+            Some(&(process_id, session_id)) => {
+                if !refresh || (only_stale && !source_is_newer(&discovered, session_id, process_id))
+                {
+                    skipped += 1;
+                    continue;
+                }
+                refresh_one(deployment, &discovered, process_id, session_id)
+                    .await
+                    .map(|()| refreshed += 1)
+            }
+            None => import_one(deployment, &discovered)
+                .await
+                .map(|()| imported += 1),
+        };
+
+        if let Err(e) = result {
+            tracing::warn!(
+                "Failed to import Claude session {}: {e}",
+                discovered.claude_session_id
+            );
+            failed.push(discovered.claude_session_id.clone());
+        }
+    }
+
+    Ok(ImportResponse {
+        imported,
+        refreshed,
+        skipped,
+        failed,
+    })
+}
+
+/// Bring imported history up to date shortly after boot.
+///
+/// Spawned rather than awaited so a large store never delays startup, and
+/// deliberately failure-tolerant: this is a convenience, not a critical path.
+pub fn spawn_startup_refresh(deployment: DeploymentImpl) {
+    tokio::spawn(async move {
+        match import_and_refresh(&deployment, None, true, true).await {
+            Ok(result) => {
+                if result.imported > 0 || result.refreshed > 0 {
+                    tracing::info!(
+                        "Claude history sync: {} imported, {} refreshed, {} unchanged, {} failed",
+                        result.imported,
+                        result.refreshed,
+                        result.skipped,
+                        result.failed.len()
+                    );
+                } else {
+                    tracing::debug!("Claude history sync: nothing to do");
+                }
+            }
+            Err(e) => tracing::warn!("Claude history sync failed: {e}"),
+        }
+    });
 }
 
 async fn scan(
@@ -566,53 +737,12 @@ async fn run_import(
     State(deployment): State<DeploymentImpl>,
     axum::Json(payload): axum::Json<ImportRequest>,
 ) -> Result<ResponseJson<ApiResponse<ImportResponse>>, ApiError> {
-    let existing = imported_map(&deployment).await?;
     let wanted: Option<HashSet<String>> =
         payload.session_ids.map(|ids| ids.into_iter().collect());
-
-    let mut imported = 0usize;
-    let mut refreshed = 0usize;
-    let mut skipped = 0usize;
-    let mut failed = Vec::new();
-
-    for discovered in scan_disk() {
-        if let Some(wanted) = &wanted
-            && !wanted.contains(&discovered.claude_session_id)
-        {
-            skipped += 1;
-            continue;
-        }
-
-        let result = match existing.get(&discovered.claude_session_id) {
-            Some(&(process_id, session_id)) => {
-                if !payload.refresh {
-                    skipped += 1;
-                    continue;
-                }
-                refresh_one(&deployment, &discovered, process_id, session_id)
-                    .await
-                    .map(|()| refreshed += 1)
-            }
-            None => import_one(&deployment, &discovered)
-                .await
-                .map(|()| imported += 1),
-        };
-
-        if let Err(e) = result {
-            tracing::warn!(
-                "Failed to import Claude session {}: {e}",
-                discovered.claude_session_id
-            );
-            failed.push(discovered.claude_session_id.clone());
-        }
-    }
-
-    Ok(ResponseJson(ApiResponse::success(ImportResponse {
-        imported,
-        refreshed,
-        skipped,
-        failed,
-    })))
+    // An explicit request refreshes unconditionally; only the startup pass
+    // limits itself to transcripts that actually changed.
+    let result = import_and_refresh(&deployment, wanted, payload.refresh, false).await?;
+    Ok(ResponseJson(ApiResponse::success(result)))
 }
 
 pub fn router(_deployment: &DeploymentImpl) -> Router<DeploymentImpl> {
