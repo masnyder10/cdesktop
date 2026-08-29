@@ -22,7 +22,10 @@ pub fn asset_dir() -> std::path::PathBuf {
 }
 
 pub fn prod_asset_dir_path() -> std::path::PathBuf {
-    ProjectDirs::from("ai", "cdesktop", "cdesktop")
+    // Fork-specific namespace. Upstream uses ("ai", "cdesktop", "cdesktop"),
+    // which would make this build share its database and execution logs with
+    // an upstream cdesktop install.
+    ProjectDirs::from("com", "littleway", "cdesktop-mr")
         .expect("OS didn't give us a home directory")
         .data_dir()
         .to_path_buf()

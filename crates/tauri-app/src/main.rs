@@ -140,6 +140,19 @@ fn main() {
     let pending_for_exit = pending_update.clone();
 
     let mut builder = tauri::Builder::default()
+        // Must be registered first. Without it every launch starts another
+        // backend server against the same SQLite database.
+        .plugin(tauri_plugin_single_instance::init(
+            |app: &tauri::AppHandle, _argv: Vec<String>, _cwd: String| {
+                // The crate-level `use tauri::Manager` is cfg-gated to macOS.
+                use tauri::Manager as _;
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.unminimize();
+                    let _ = window.show();
+                    let _ = window.set_focus();
+                }
+            },
+        ))
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_notification::init())
