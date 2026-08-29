@@ -67,6 +67,10 @@ pub struct DiscoveredSession {
     pub title: String,
     pub message_count: usize,
     pub started_at: Option<DateTime<Utc>>,
+    /// Timestamp of the last message. The sidebar orders by
+    /// `MAX(execution_processes.completed_at, workspaces.updated_at)`, so without
+    /// this every imported session sorts by import time instead of real recency.
+    pub last_activity: Option<DateTime<Utc>>,
     pub git_branch: Option<String>,
     #[ts(skip)]
     #[serde(skip)]
@@ -248,6 +252,7 @@ fn parse_transcript(path: &Path) -> Option<DiscoveredSession> {
     let mut title: Option<String> = None;
     let mut git_branch: Option<String> = None;
     let mut started_at: Option<DateTime<Utc>> = None;
+    let mut last_activity: Option<DateTime<Utc>> = None;
     let mut first_prompt: Option<String> = None;
     let mut entries: Vec<NormalizedEntry> = Vec::new();
     let mut claude_session_id: Option<String> = None;
@@ -297,11 +302,12 @@ fn parse_transcript(path: &Path) -> Option<DiscoveredSession> {
                     .get("timestamp")
                     .and_then(|t| t.as_str())
                     .map(|s| s.to_string());
-                if started_at.is_none()
-                    && let Some(ts) = timestamp.as_deref()
+                if let Some(ts) = timestamp.as_deref()
                     && let Ok(parsed) = DateTime::parse_from_rfc3339(ts)
                 {
-                    started_at = Some(parsed.with_timezone(&Utc));
+                    let parsed = parsed.with_timezone(&Utc);
+                    started_at.get_or_insert(parsed);
+                    last_activity = Some(parsed);
                 }
 
                 let Some(message) = rec.get("message") else {
@@ -402,6 +408,7 @@ fn parse_transcript(path: &Path) -> Option<DiscoveredSession> {
         title,
         message_count,
         started_at,
+        last_activity,
         git_branch,
         entries,
         first_prompt,
@@ -446,13 +453,14 @@ fn scan_disk() -> Vec<DiscoveredSession> {
 /// file on disk, so a refresh can rewrite it in place.
 async fn imported_map(
     deployment: &DeploymentImpl,
-) -> Result<HashMap<String, (Uuid, Uuid)>, sqlx::Error> {
+) -> Result<HashMap<String, ImportedRefs>, sqlx::Error> {
     // Deliberately not a `query!` macro: this is a new query, and the macro form would
     // require regenerating the offline sqlx metadata.
-    let rows: Vec<(String, Uuid, Uuid)> = sqlx::query_as(
-        r#"SELECT t.agent_session_id, t.execution_process_id, p.session_id
+    let rows: Vec<(String, Uuid, Uuid, Uuid)> = sqlx::query_as(
+        r#"SELECT t.agent_session_id, t.execution_process_id, p.session_id, s.workspace_id
            FROM coding_agent_turns t
            JOIN execution_processes p ON p.id = t.execution_process_id
+           JOIN sessions s ON s.id = p.session_id
            WHERE t.agent_session_id IS NOT NULL"#,
     )
     .fetch_all(&deployment.db().pool)
@@ -460,7 +468,16 @@ async fn imported_map(
 
     Ok(rows
         .into_iter()
-        .map(|(claude_id, process_id, session_id)| (claude_id, (process_id, session_id)))
+        .map(|(claude_id, process_id, session_id, workspace_id)| {
+            (
+                claude_id,
+                ImportedRefs {
+                    process_id,
+                    session_id,
+                    workspace_id,
+                },
+            )
+        })
         .collect())
 }
 
@@ -489,6 +506,51 @@ async fn write_transcript(
     Ok(())
 }
 
+/// Where an already-imported Claude session lives in cdesktop's tables.
+#[derive(Debug, Clone, Copy)]
+struct ImportedRefs {
+    process_id: Uuid,
+    session_id: Uuid,
+    workspace_id: Uuid,
+}
+
+/// Stamp the imported rows with the transcript's real times.
+///
+/// Rows otherwise carry the moment of import, so every imported session sorts
+/// identically and the sidebar cannot order by recency. The workspace list orders
+/// by `MAX(execution_processes.completed_at, workspaces.updated_at)`, so both
+/// matter. Not a `query!` macro: new queries would need the offline sqlx metadata
+/// regenerated.
+async fn apply_real_timestamps(
+    deployment: &DeploymentImpl,
+    workspace_id: Uuid,
+    process_id: Uuid,
+    discovered: &DiscoveredSession,
+) -> Result<(), sqlx::Error> {
+    let (Some(started), Some(last)) = (discovered.started_at, discovered.last_activity) else {
+        return Ok(());
+    };
+    let pool = &deployment.db().pool;
+
+    sqlx::query("UPDATE workspaces SET created_at = ?, updated_at = ? WHERE id = ?")
+        .bind(started)
+        .bind(last)
+        .bind(workspace_id)
+        .execute(pool)
+        .await?;
+
+    sqlx::query("UPDATE execution_processes SET started_at = ?, completed_at = ?, created_at = ?, updated_at = ? WHERE id = ?")
+        .bind(started)
+        .bind(last)
+        .bind(started)
+        .bind(last)
+        .bind(process_id)
+        .execute(pool)
+        .await?;
+
+    Ok(())
+}
+
 /// Whether the source transcript is newer than what was last written for it.
 /// Rewriting 50-odd transcripts on every launch is pointless churn when almost
 /// none of them have changed.
@@ -511,12 +573,14 @@ fn source_is_newer(discovered: &DiscoveredSession, session_id: Uuid, process_id:
 async fn refresh_one(
     deployment: &DeploymentImpl,
     discovered: &DiscoveredSession,
-    process_id: Uuid,
-    session_id: Uuid,
+    refs: ImportedRefs,
 ) -> Result<(), ApiError> {
-    write_transcript(session_id, process_id, &discovered.entries).await?;
+    write_transcript(refs.session_id, refs.process_id, &discovered.entries).await?;
     // The title can change too: Claude rewrites `ai-title` as a conversation develops.
-    CodingAgentTurn::update_summary(&deployment.db().pool, process_id, &discovered.title).await?;
+    CodingAgentTurn::update_summary(&deployment.db().pool, refs.process_id, &discovered.title)
+        .await?;
+    // A growing session has a newer last message, so its ordering must move too.
+    apply_real_timestamps(deployment, refs.workspace_id, refs.process_id, discovered).await?;
     Ok(())
 }
 
@@ -546,13 +610,15 @@ pub async fn import_and_refresh(
         }
 
         let result = match existing.get(&discovered.claude_session_id) {
-            Some(&(process_id, session_id)) => {
-                if !refresh || (only_stale && !source_is_newer(&discovered, session_id, process_id))
+            Some(&refs) => {
+                if !refresh
+                    || (only_stale
+                        && !source_is_newer(&discovered, refs.session_id, refs.process_id))
                 {
                     skipped += 1;
                     continue;
                 }
-                refresh_one(deployment, &discovered, process_id, session_id)
+                refresh_one(deployment, &discovered, refs)
                     .await
                     .map(|()| refreshed += 1)
             }
@@ -729,6 +795,9 @@ async fn import_one(
     CodingAgentTurn::update_agent_session_id(pool, process.id, &discovered.claude_session_id)
         .await?;
     CodingAgentTurn::update_summary(pool, process.id, &discovered.title).await?;
+
+    // Last, because update_completion above stamps completed_at with the current time.
+    apply_real_timestamps(deployment, workspace.id, process.id, discovered).await?;
 
     Ok(())
 }

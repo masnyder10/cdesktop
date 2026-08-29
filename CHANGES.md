@@ -103,6 +103,12 @@ NSIS `.exe` installers natively on Windows 11.
     is inferred from usage above 200K when the transcript records a plain model
     id without the `[1m]` marker; taking the id at face value would otherwise
     peg a 1M session at 100%.
+  - Stamps the imported rows with the transcript's real first and last message
+    times. Rows otherwise carry the moment of import, leaving all 51 workspaces
+    with an identical timestamp; since the sidebar orders by
+    `MAX(execution_processes.completed_at, workspaces.updated_at)`, imported
+    sessions had no meaningful order at all. Refresh re-stamps them, so a growing
+    session moves up the list.
   - Fidelity: `tool_result` blocks are skipped because `NormalizedEntry` has no
     ToolResult variant, which is also why the live normaliser drops them.
     `thinking` blocks are skipped when empty; in current transcripts the
