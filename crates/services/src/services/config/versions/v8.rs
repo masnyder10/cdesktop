@@ -21,6 +21,10 @@ fn default_commit_reminder_enabled() -> bool {
     false
 }
 
+fn default_auto_review_enabled() -> bool {
+    false
+}
+
 fn default_relay_enabled() -> bool {
     true
 }
@@ -60,6 +64,13 @@ pub struct Config {
     pub pr_auto_description_prompt: Option<String>,
     #[serde(default = "default_commit_reminder_enabled")]
     pub commit_reminder_enabled: bool,
+    /// Run a review automatically when a coding agent turn completes.
+    #[serde(default = "default_auto_review_enabled")]
+    pub auto_review_enabled: bool,
+    /// Executor for the automatic review. None reviews with the same agent that
+    /// did the work; naming a different one gets a genuine second opinion.
+    #[serde(default)]
+    pub auto_review_executor: Option<ExecutorProfileId>,
     #[serde(default)]
     pub commit_reminder_prompt: Option<String>,
     #[serde(default)]
@@ -102,6 +113,8 @@ impl Config {
             pr_auto_description_enabled: true,
             pr_auto_description_prompt: None,
             commit_reminder_enabled: false,
+            auto_review_enabled: false,
+            auto_review_executor: None,
             commit_reminder_prompt: None,
             send_message_shortcut: SendMessageShortcut::default(),
             relay_enabled: true,
@@ -158,6 +171,8 @@ impl Default for Config {
             pr_auto_description_enabled: true,
             pr_auto_description_prompt: None,
             commit_reminder_enabled: false,
+            auto_review_enabled: false,
+            auto_review_executor: None,
             commit_reminder_prompt: None,
             send_message_shortcut: SendMessageShortcut::default(),
             relay_enabled: true,

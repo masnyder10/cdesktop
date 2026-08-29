@@ -2013,10 +2013,18 @@ impl ClaudeLogProcessor {
                 let idx = entry_index_provider.next();
                 patches.push(ConversationPatch::add_normalized_entry(idx, entry));
             }
+            ClaudeJson::RateLimitEvent {
+                rate_limit_info, ..
+            } => {
+                // Account-wide and only emitted mid-run, so it is kept in a
+                // process-global store rather than the session transcript.
+                if let Some(info) = rate_limit_info {
+                    crate::rate_limit::record(info);
+                }
+            }
             ClaudeJson::ControlRequest { .. }
             | ClaudeJson::ControlResponse { .. }
-            | ClaudeJson::ControlCancelRequest { .. }
-            | ClaudeJson::RateLimitEvent { .. } => {}
+            | ClaudeJson::ControlCancelRequest { .. } => {}
         }
         patches
     }

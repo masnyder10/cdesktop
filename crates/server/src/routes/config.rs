@@ -43,6 +43,7 @@ use crate::{
 pub fn router() -> Router<DeploymentImpl> {
     Router::new()
         .route("/info", get(get_user_system_info))
+        .route("/rate-limits", get(get_rate_limits))
         .route("/config", put(update_config))
         .route("/sounds/{sound}", get(get_sound))
         .route("/mcp-config", get(get_mcp_servers).post(update_mcp_servers))
@@ -476,6 +477,18 @@ async fn get_profiles(
         content,
         path: profiles_path.display().to_string(),
     }))
+}
+
+/// Latest rate-limit state reported by the coding agent.
+///
+/// Populated only while an agent runs, so this is empty until the first turn of
+/// a session and can otherwise be stale. Carries which window is in force,
+/// whether requests are allowed, and when it resets. The agent does not report
+/// a utilisation percentage, so none is returned.
+async fn get_rate_limits(
+    State(_deployment): State<DeploymentImpl>,
+) -> ResponseJson<ApiResponse<Vec<executors::rate_limit::RateLimitSnapshot>>> {
+    ResponseJson(ApiResponse::success(executors::rate_limit::snapshots()))
 }
 
 async fn update_profiles(

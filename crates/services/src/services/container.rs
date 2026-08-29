@@ -28,13 +28,16 @@ use db::{
 use executors::executors::qa_mock::QaMockExecutor;
 #[cfg(not(feature = "qa-mode"))]
 use executors::profile::ExecutorConfigs;
+
+use crate::services::config::Config;
 use executors::{
     actions::{
         ExecutorAction, ExecutorActionType,
         coding_agent_initial::CodingAgentInitialRequest,
+        review::{RepoReviewContext, ReviewRequest},
         script::{ScriptContext, ScriptRequest, ScriptRequestLanguage},
     },
-    executors::{ExecutorError, StandardCodingAgentExecutor},
+    executors::{ExecutorError, StandardCodingAgentExecutor, build_review_prompt},
     logs::{
         NormalizedEntry, NormalizedEntryError, NormalizedEntryType,
         utils::{
@@ -94,6 +97,10 @@ pub trait ContainerService {
     fn git(&self) -> &GitService;
 
     fn notification_service(&self) -> &NotificationService;
+
+    /// Needed by completion side-effects such as auto-review, which have to know
+    /// whether the feature is enabled and which executor to review with.
+    fn config(&self) -> &Arc<RwLock<Config>>;
 
     async fn touch(&self, workspace: &Workspace) -> Result<(), ContainerError>;
 
@@ -314,6 +321,155 @@ pub trait ContainerService {
         self.notification_service()
             .notify(&title, &message, Some(ctx.workspace.id))
             .await;
+
+        self.maybe_start_auto_review(ctx).await;
+    }
+
+    /// Review the work automatically once a coding agent turn completes.
+    ///
+    /// The manual review action resumes the agent's own session, so the same
+    /// model critiques itself. This deliberately starts a fresh session instead:
+    /// a second opinion is only worth having if it can disagree, and resuming
+    /// would also be meaningless when reviewing with a different executor.
+    ///
+    /// Best-effort throughout. A failure here must never affect the run that
+    /// just finished, so every error is logged and swallowed.
+    async fn maybe_start_auto_review(&self, ctx: &ExecutionContext) {
+        if !matches!(
+            ctx.execution_process.run_reason,
+            ExecutionProcessRunReason::CodingAgent
+        ) || !matches!(
+            ctx.execution_process.status,
+            ExecutionProcessStatus::Completed
+        ) {
+            return;
+        }
+
+        // Reviews run as CodingAgent too, so without this a review would trigger
+        // a review of itself, forever.
+        match ctx.execution_process.executor_action() {
+            Ok(action) => {
+                if matches!(action.typ, ExecutorActionType::ReviewRequest(_)) {
+                    return;
+                }
+            }
+            Err(e) => {
+                tracing::warn!("auto-review: could not read executor action: {e}");
+                return;
+            }
+        }
+
+        let (enabled, configured_executor) = {
+            let config = self.config().read().await;
+            (config.auto_review_enabled, config.auto_review_executor.clone())
+        };
+        if !enabled {
+            return;
+        }
+
+        let pool = &self.db().pool;
+
+        // start_execution would contend with anything still running in this
+        // workspace; the manual review path performs the same check.
+        match ExecutionProcess::has_running_non_dev_server_processes_for_workspace(
+            pool,
+            ctx.workspace.id,
+        )
+        .await
+        {
+            Ok(true) => return,
+            Ok(false) => {}
+            Err(e) => {
+                tracing::warn!("auto-review: could not check running processes: {e}");
+                return;
+            }
+        }
+
+        // Base commits per repo, so the reviewer is told exactly what to diff.
+        // Without them the prompt degrades to "review the changes" with no range.
+        let mut contexts = Vec::new();
+        match WorkspaceRepo::find_repos_with_target_branch_for_workspace(pool, ctx.workspace.id)
+            .await
+        {
+            Ok(repos) => {
+                for repo in repos {
+                    let Some(worktree_path) = ctx.workspace.execution_dir(&repo.repo) else {
+                        continue;
+                    };
+                    if let Ok(base_commit) = self.git().get_fork_point(
+                        &worktree_path,
+                        &repo.target_branch,
+                        &ctx.workspace.branch,
+                    ) {
+                        contexts.push(RepoReviewContext {
+                            repo_id: repo.repo.id,
+                            repo_name: repo.repo.display_name,
+                            base_commit,
+                        });
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!("auto-review: could not load workspace repos: {e}");
+                return;
+            }
+        }
+        let contexts = if contexts.is_empty() {
+            None
+        } else {
+            Some(contexts)
+        };
+
+        let executor_config: ExecutorConfig = match configured_executor {
+            Some(profile_id) => profile_id.into(),
+            // Fall back to whatever the session last ran with, so the reviewer at
+            // least matches the author rather than the global default.
+            None => {
+                match ExecutionProcess::latest_executor_config_for_session(pool, ctx.session.id)
+                    .await
+                {
+                    Ok(Some((config, _model))) => config,
+                    Ok(None) => {
+                        tracing::debug!("auto-review: no executor config for session, skipping");
+                        return;
+                    }
+                    Err(e) => {
+                        tracing::warn!("auto-review: could not resolve executor config: {e}");
+                        return;
+                    }
+                }
+            }
+        };
+
+        let prompt = build_review_prompt(contexts.as_deref(), None);
+        let action = ExecutorAction::new(
+            ExecutorActionType::ReviewRequest(ReviewRequest {
+                executor_config,
+                context: contexts,
+                prompt,
+                // Fresh session: see the note above.
+                session_id: None,
+                working_dir: ctx.session.agent_working_dir.clone(),
+            }),
+            None,
+        );
+
+        match self
+            .start_execution(
+                &ctx.workspace,
+                &ctx.session,
+                &action,
+                &ExecutionProcessRunReason::CodingAgent,
+            )
+            .await
+        {
+            Ok(process) => tracing::info!(
+                "auto-review started: process {} for workspace {}",
+                process.id,
+                ctx.workspace.id
+            ),
+            Err(e) => tracing::warn!("auto-review: failed to start: {e}"),
+        }
     }
 
     /// Cleanup executions marked as running in the db, call at startup
