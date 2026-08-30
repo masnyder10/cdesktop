@@ -78,8 +78,30 @@ export function useSessionMessageEditor({
     [scratchId, updateScratch]
   );
 
-  const { debounced: debouncedSave, cancel: cancelDebouncedSave } =
-    useDebouncedCallback(saveToScratch, 500);
+  const {
+    debounced: debouncedSave,
+    cancel: cancelDebouncedSave,
+    flush: flushDebouncedSave,
+  } = useDebouncedCallback(saveToScratch, 500);
+
+  // Persist a pending draft when the window is closing or hidden. The debounce
+  // otherwise sits for up to 500ms, so typing then immediately closing the app
+  // lost the last edit. visibilitychange fires before teardown on close/minimize;
+  // pagehide/beforeunload cover the rest.
+  useEffect(() => {
+    const flushIfHidden = () => {
+      if (document.visibilityState === 'hidden') flushDebouncedSave();
+    };
+    const flush = () => flushDebouncedSave();
+    document.addEventListener('visibilitychange', flushIfHidden);
+    window.addEventListener('pagehide', flush);
+    window.addEventListener('beforeunload', flush);
+    return () => {
+      document.removeEventListener('visibilitychange', flushIfHidden);
+      window.removeEventListener('pagehide', flush);
+      window.removeEventListener('beforeunload', flush);
+    };
+  }, [flushDebouncedSave]);
 
   // Track whether initial load has happened to avoid re-syncing during typing
   const hasLoadedRef = useRef(false);

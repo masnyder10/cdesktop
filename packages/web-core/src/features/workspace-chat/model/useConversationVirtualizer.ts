@@ -404,6 +404,17 @@ export function useConversationVirtualizer({
 
       bottomLockedRef.current = true;
 
+      // Already pinned? Don't reassign scrollTop. In a virtualized list
+      // scrollHeight is built from estimated sizes for the off-screen rows above
+      // and typically runs short, so scrollHeight - clientHeight lands ABOVE the
+      // true bottom — a visible upward jump when the user was already at the
+      // bottom (e.g. the instant they hit enter, which scrolls to bottom before
+      // the message is even added). The bottom lock above still keeps following
+      // engaged; we simply skip the redundant, jump-inducing reassignment.
+      if (isNearBottom(el.scrollTop, el.clientHeight, el.scrollHeight)) {
+        return;
+      }
+
       if (behavior === 'smooth') {
         smoothScrollDeadlineRef.current = performance.now() + 500;
         el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' });
