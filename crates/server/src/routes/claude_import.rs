@@ -648,23 +648,35 @@ pub async fn import_and_refresh(
 ///
 /// Spawned rather than awaited so a large store never delays startup, and
 /// deliberately failure-tolerant: this is a convenience, not a critical path.
+/// Seconds between background syncs. A session driven elsewhere (the VS Code
+/// extension, a terminal) grows continuously; without a periodic pass cdesktop
+/// only caught up on restart. Only stale transcripts are rewritten, so an idle
+/// tick does almost no work.
+const SYNC_INTERVAL_SECS: u64 = 30;
+
 pub fn spawn_startup_refresh(deployment: DeploymentImpl) {
     tokio::spawn(async move {
-        match import_and_refresh(&deployment, None, true, true).await {
-            Ok(result) => {
-                if result.imported > 0 || result.refreshed > 0 {
-                    tracing::info!(
-                        "Claude history sync: {} imported, {} refreshed, {} unchanged, {} failed",
-                        result.imported,
-                        result.refreshed,
-                        result.skipped,
-                        result.failed.len()
-                    );
-                } else {
-                    tracing::debug!("Claude history sync: nothing to do");
+        // Run once immediately at boot, then on a fixed interval for the life of
+        // the process. The first tick fires right away.
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(SYNC_INTERVAL_SECS));
+        loop {
+            ticker.tick().await;
+            match import_and_refresh(&deployment, None, true, true).await {
+                Ok(result) => {
+                    if result.imported > 0 || result.refreshed > 0 {
+                        tracing::info!(
+                            "Claude history sync: {} imported, {} refreshed, {} unchanged, {} failed",
+                            result.imported,
+                            result.refreshed,
+                            result.skipped,
+                            result.failed.len()
+                        );
+                    } else {
+                        tracing::debug!("Claude history sync: nothing to do");
+                    }
                 }
+                Err(e) => tracing::warn!("Claude history sync failed: {e}"),
             }
-            Err(e) => tracing::warn!("Claude history sync failed: {e}"),
         }
     });
 }
