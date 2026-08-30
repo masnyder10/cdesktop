@@ -1428,6 +1428,11 @@ impl ClaudeLogProcessor {
                             patches.push(ConversationPatch::replace(info.entry_index, entry));
                         }
                     }
+                    // Progress-only system events that carry no conversational
+                    // content. `thinking_tokens` is a live token counter emitted
+                    // repeatedly while the model thinks; rendering each one spams
+                    // the transcript with "System: thinking_tokens" rows.
+                    Some("thinking_tokens") => {}
                     Some(subtype) => {
                         let entry = NormalizedEntry {
                             timestamp: None,
@@ -2876,6 +2881,16 @@ mod tests {
             NormalizedEntryType::AssistantMessage
         ));
         assert_eq!(entries[0].content, "Hi! I'm Claude Code.");
+    }
+
+    #[test]
+    fn test_thinking_tokens_system_event_is_dropped() {
+        // Live token-counter events emitted repeatedly while the model thinks.
+        // Captured verbatim from the CLI; must not surface as transcript rows.
+        let json = r#"{"type":"system","subtype":"thinking_tokens","estimated_tokens":128,"estimated_tokens_delta":16,"uuid":"u","session_id":"s"}"#;
+        let parsed: ClaudeJson = serde_json::from_str(json).unwrap();
+        let entries = normalize(&parsed, "");
+        assert_eq!(entries.len(), 0, "thinking_tokens should produce no entries");
     }
 
     #[test]
