@@ -635,7 +635,15 @@ export const ConversationList = forwardRef<
     const wasStreaming = prevStreamingRef.current;
     prevStreamingRef.current = hasActiveStreamingTurn;
     if (wasStreaming === hasActiveStreamingTurn) return;
-    if (!conversationVirtualizer.isAtBottom) return;
+
+    // A turn starting means the user just sent a message (or resumed) — they
+    // always want to see it and the incoming reply, so pin unconditionally. The
+    // at-bottom guard is wrong here: adding the user row shifts layout and makes
+    // the sampled at-bottom read false, which is exactly why the user's own
+    // messages jumped while streaming replies (already at bottom) did not. On a
+    // turn ending, keep the guard so a user reading history is never yanked down.
+    const turnStarted = !wasStreaming && hasActiveStreamingTurn;
+    if (!turnStarted && !conversationVirtualizer.isAtBottom) return;
 
     let secondFrame = 0;
     const firstFrame = requestAnimationFrame(() => {
