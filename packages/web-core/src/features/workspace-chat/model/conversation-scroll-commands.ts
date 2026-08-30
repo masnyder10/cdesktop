@@ -14,7 +14,15 @@ import type { AddEntryType } from '@/shared/hooks/useConversationHistory/types';
  * Pixel distance from bottom within which the user is considered "at bottom".
  * Accounts for sub-pixel rounding, scroll inertia, and minor content growth.
  */
-export const NEAR_BOTTOM_THRESHOLD_PX = 16;
+// How close to the bottom still counts as "at the bottom" for the purpose of
+// sticking to it. The container disables native scroll anchoring
+// (overflowAnchor: none), so this JS check alone decides whether the bottom lock
+// engages. At 16px it was so tight that a streaming reply, a composer resize, or
+// a measurement rounding error would drop out of the stick zone — the lock
+// disengaged, the view jumped, and the user had to scroll back down. A more
+// forgiving band keeps the lock engaged through those small shifts while still
+// releasing when the user deliberately scrolls up to read history.
+export const NEAR_BOTTOM_THRESHOLD_PX = 120;
 
 // ---------------------------------------------------------------------------
 // Scroll Intent
