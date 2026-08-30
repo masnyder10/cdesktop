@@ -618,6 +618,41 @@ export const ConversationList = forwardRef<
   });
   scrollOnEntriesChangedRef.current = scrollExecutor.onEntriesChanged;
 
+  // Re-pin to the bottom across streaming<->settled transitions.
+  //
+  // Near the bottom, tail rows render un-virtualized during a turn for smooth
+  // streaming, then move back into the virtualizer (with estimated sizes) when
+  // it ends. That mode switch shifts layout, which is what made the view jump on
+  // submit (settled -> streaming) and again on completion (streaming ->
+  // settled) even though mid-stream following already works. The per-update
+  // scroll intent samples at-bottom before this relayout, so it misses it.
+  //
+  // Guarded by the synced isAtBottom so a user who scrolled up to read history
+  // is never yanked down. Two frames: one for React to commit the mode change,
+  // one for the virtualizer to lay out the re-virtualized tail, then snap.
+  const prevStreamingRef = useRef(hasActiveStreamingTurn);
+  useEffect(() => {
+    const wasStreaming = prevStreamingRef.current;
+    prevStreamingRef.current = hasActiveStreamingTurn;
+    if (wasStreaming === hasActiveStreamingTurn) return;
+    if (!conversationVirtualizer.isAtBottom) return;
+
+    let secondFrame = 0;
+    const firstFrame = requestAnimationFrame(() => {
+      secondFrame = requestAnimationFrame(() => {
+        scrollToBottomAndClearSpacer('auto');
+      });
+    });
+    return () => {
+      cancelAnimationFrame(firstFrame);
+      if (secondFrame) cancelAnimationFrame(secondFrame);
+    };
+  }, [
+    hasActiveStreamingTurn,
+    conversationVirtualizer.isAtBottom,
+    scrollToBottomAndClearSpacer,
+  ]);
+
   // Determine if there are entries to show placeholders
   const hasEntries = conversationRows.length > 0;
 
